@@ -1,3 +1,3 @@
-# iostream is a golang package to help with streaming conversions
+# iostream - a golang library
 
-Primary goal for now is converting an io.WriterAt to an io.Writer
+The primary goal of iostream for now is converting an io.WriterAt to an io.Writer as long as the WriterAt has a predictable pattern of spawning multiple goroutines that are try to fill out the file from the start.
