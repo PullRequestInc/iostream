@@ -10,6 +10,7 @@ The primary goal of iostream for now is converting an io.WriterAt to an io.Write
 ```golang
 writer := new(bytes.Buffer)
 stream := iostream.OpenWriterAtStream(writer, 2, 2)
+defer stream.Close()
 if _, err := stream.WriteAt([]byte("1234"), 0); err != nil {
 	panic(err)
 }
@@ -26,6 +27,7 @@ writer := new(bytes.Buffer)
 numBuffers := s3manager.DefaultDownloadConcurrency + 3
 bufferSize := s3manager.DefaultDownloadPartSize
 stream := iostream.OpenWriterAtStream(writer, numBuffers, bufferSize)
+defer stream.Close()
 n, err := downloader.Download(f, &s3.GetObjectInput{
     Bucket: aws.String(myBucket),
     Key:    aws.String(myString),
