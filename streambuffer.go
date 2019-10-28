@@ -27,10 +27,10 @@ var ErrAfterBounds = errors.New("WriteAt attempt is after end of buffer")
 // rotating buffers of size bufferSize.
 func NewStreamBuffer(bufferCount int, bufferSize int) *StreamBuffer {
 	// Initialize all of the buffers at once.
-	// We could eventually do this more dynamically and only initialiize new ones as needed
+	// We could eventually do this more dynamically and only initialize new ones as needed
 	// to optimize for smaller streams.
 	buffers := ring.New(bufferCount)
-	for i := 0; i < bufferSize; i++ {
+	for i := 0; i < bufferCount; i++ {
 		buffers.Value = bytes.NewBuffer(make([]byte, bufferSize))
 		buffers = buffers.Next()
 	}
@@ -96,14 +96,9 @@ func (b *StreamBuffer) WriteAt(p []byte, off int64) (n int, err error) {
 	return written, nil
 }
 
-// Flush will flush all bytes that are fully written from the start of the internal
-// buffer. These bytes will not be returned again.
-func (b *StreamBuffer) Flush() []byte {
-	b.Lock()
-	defer b.Unlock()
-
-	normalizedFlushedOffset := b.flushedOffset - b.offset
-
+// advanceWritable should be called with the lock already taken. it will return the number of bytes
+// that are available to write while also advancing the stream buffer's flushed offset
+func (b *StreamBuffer) advanceWritable() int {
 	toWrite := 0
 
 	for {
@@ -116,12 +111,24 @@ func (b *StreamBuffer) Flush() []byte {
 		b.flushedOffset = newOffset
 	}
 
+	return toWrite
+}
+
+// Flush will flush all bytes that are fully written from the start of the internal
+// buffer. These bytes will not be returned again.
+func (b *StreamBuffer) Flush() []byte {
+	b.Lock()
+	defer b.Unlock()
+
+	// calculate normalizedFlushOffset before advancing writeable state
+	normalizedFlushedOffset := b.flushedOffset - b.offset
+
+	toWrite := b.advanceWritable()
 	if toWrite == 0 {
 		return nil
 	}
 
 	out := make([]byte, toWrite)
-
 	written := 0
 
 	for i := 0; i < b.buffers.Len(); i++ {

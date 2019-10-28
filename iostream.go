@@ -9,8 +9,8 @@ import (
 // It will use mutliple buffers, but prevent letting the entire file being written in memory.
 // It should only be used if there is a guarantee that the next chunk of bytes that the writer
 // needs will eventually be passed if WriteAt is blocking for other writes further in the stream.
-// The io.WriterAt should also only attempt to a chunk of bytes once, as once a chunk has been
-// written, it is assumed that the buffer's offset can advance.
+// The io.WriterAt should also only attempt to write a chunk of bytes once, as once a chunk has
+// been written, it is assumed that the buffer's offset can advance.
 type WriterAtStream struct {
 	buffer    *StreamBuffer
 	writer    io.Writer

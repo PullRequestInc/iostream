@@ -18,8 +18,6 @@ func TestSingleChunkSingleBuffer(t *testing.T) {
 	stream.Close()
 	require.NoError(t, err)
 	require.Equal(t, 4, written)
-
-	require.NoError(t, err)
 	require.Equal(t, "1234", buf.String())
 }
 
@@ -34,7 +32,6 @@ func TestMultipleChunksSingleBuffer(t *testing.T) {
 
 	stream.Close()
 
-	require.NoError(t, err)
 	require.Equal(t, "1234", buf.String())
 }
 
@@ -56,7 +53,6 @@ func TestMultipleChunksWithBlockedChunksBeyondBuffer(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		stream.WriteAt([]byte("far away"), 100)
-		// require.NoError(t, err)
 		cleanedUp = true
 		wg.Done()
 	}()
@@ -81,6 +77,5 @@ func TestMultipleChunksWithBlockedChunksBeyondBuffer(t *testing.T) {
 
 	require.True(t, cleanedUp)
 
-	require.NoError(t, err)
 	require.Equal(t, "1234567890123456", buf.String())
 }
