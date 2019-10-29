@@ -31,7 +31,6 @@ func TestMultipleChunksSingleBuffer(t *testing.T) {
 	require.NoError(t, err)
 
 	stream.Close()
-
 	require.Equal(t, "1234", buf.String())
 }
 
