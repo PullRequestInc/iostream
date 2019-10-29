@@ -51,8 +51,9 @@ func TestMultipleChunksWithBlockedChunksBeyondBuffer(t *testing.T) {
 	cleanedUp := false
 	wg := sync.WaitGroup{}
 	wg.Add(1)
+	var writeErr error
 	go func() {
-		stream.WriteAt([]byte("far away"), 100)
+		_, writeErr = stream.WriteAt([]byte("far away"), 100)
 		cleanedUp = true
 		wg.Done()
 	}()
@@ -69,6 +70,7 @@ func TestMultipleChunksWithBlockedChunksBeyondBuffer(t *testing.T) {
 
 	_, err = stream.WriteAt([]byte("5678"), 4)
 	require.NoError(t, err)
+	require.Equal(t, "1234567890123456", buf.String())
 
 	require.False(t, cleanedUp)
 
@@ -78,4 +80,6 @@ func TestMultipleChunksWithBlockedChunksBeyondBuffer(t *testing.T) {
 	require.True(t, cleanedUp)
 
 	require.Equal(t, "1234567890123456", buf.String())
+
+	require.EqualError(t, writeErr, "WriterAtStream Closed")
 }
