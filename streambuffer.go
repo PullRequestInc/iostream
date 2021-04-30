@@ -7,13 +7,34 @@ import (
 	"sync"
 )
 
+// StreamBuffer represents a buffer for streaming data that consolidates random
+// accesses into sequential accesses using a moving buffer. This buffer
+// contains a series of pre-allocated buffers. Each time the user writes a
+// chunk of data via the WriteAt function, it figures out where in the
+// pre-allocated buffers that chunk of data should go. When the user wants to
+// flush data, we'll return the largest contiguous chunk and advance to the
+// next non-flushed buffer.
 type StreamBuffer struct {
 	sync.Mutex
-	bufferSize    int
-	offset        int64
+
+	// bufferSize represents the size of each individual buffer in our buffers
+	// ring buffer
+	bufferSize int
+
+	// buffers is the ring buffer holding all of our individual buffers
+	buffers *ring.Ring
+
+	// offset is the current absolute offset in the streaming operation of the
+	// first buffer in the ring buffer
+	offset int64
+
+	// flushedOffset is the current absolute offset in the streaming operation
+	// of the first chunk of data that hasn't yet been flushed. This value can
+	// straddle buffers.
 	flushedOffset int64
-	buffers       *ring.Ring
-	// map from starting offset through ending offset
+
+	// writtenChunks is a map of absolute write offsets to the absolute offset
+	// of the next available byte after the write (offset + len(writeBuf))
 	writtenChunks map[int64]int64
 }
 
@@ -51,48 +72,69 @@ func (b *StreamBuffer) WriteAt(p []byte, off int64) (n int, err error) {
 	b.Lock()
 	defer b.Unlock()
 
+	// Check to see if the current write can fit into our current buffer window
+	// denoted by [b.offset, b.offset + buffer length * buffer size)
 	if off < b.offset {
 		return 0, ErrBeforeBounds
 	}
 	if off+int64(len(p)) > b.offset+int64(b.buffers.Len())*int64(b.bufferSize) {
 		return 0, ErrAfterBounds
 	}
+
+	// normalizedOffset is the offset of the write relative to the first buffer
+	// in our ring of buffers
 	normalizedOffset := off - b.offset
-	written := 0
+
+	// written is how much data we have written so far
+	var written int
 
 	buffers := b.buffers
 	for i := 0; i < b.buffers.Len(); i++ {
-		// if the write is beyond the current buffer then continue
+		// if the write is beyond the current buffer, then continue
 		if normalizedOffset+int64(written) > int64((i+1)*b.bufferSize) {
 			buffers = buffers.Next()
 			continue
 		}
+
 		// copy the portion of p bytes that fit in current buffer
 		buf := buffers.Value.(*bytes.Buffer)
 		data := buf.Bytes()
 
+		// bufferStart is the normalized offset of the buf above relative to
+		// the current offset of the overall buffer
 		bufferStart := i * b.bufferSize
-		bufferEnd := (i + 1) * b.bufferSize
 
-		copyStart := normalizedOffset + int64(written-bufferStart)
-		copyEnd := copyStart + int64(len(p)-written)
-		if copyEnd > int64(bufferEnd) {
-			copyEnd = int64(bufferEnd - bufferStart)
+		// copyStart and copyEnd are the destination boundaries of the copy
+		// operation into the current buffer like [copyStart, copyEnd)
+		copyStart := int(normalizedOffset + int64(written) - int64(bufferStart))
+		copyEnd := copyStart + len(p) - written
+
+		// Don't copy more than the size of the current buffer. If we're going
+		// to go beyond, limit it. We'll be sure to write to the next buffer
+		// next.
+		if copyEnd > b.bufferSize {
+			copyEnd = b.bufferSize
 		}
-		copy(data[copyStart:copyEnd], p[written:copyEnd-copyStart+int64(written)])
 
-		written += int(copyEnd - copyStart)
+		// Actually perform the copy operation
+		copyLength := copyEnd - copyStart
+		copy(data[copyStart:copyEnd], p[written:copyLength+written])
 
+		// If we've finished writing, go ahead and break out. If not, advance
+		// to the next write that we're to perform.
+		written += copyLength
 		if written >= len(p) {
 			break
 		}
-
 		buffers = buffers.Next()
 	}
 
-	// update state for written chunks
+	// Update the state for written chunks. We'll use this mapping later to
+	// figure out the largest contiguous chunk when we flush the data.
+	// FIXME: Subsequent writes to this offset of a different length will break
+	// this mechanism. This mechanism is only for mutually exclusive chunks of
+	// data.
 	b.writtenChunks[off] = off + int64(len(p))
-
 	return written, nil
 }
 
@@ -101,6 +143,9 @@ func (b *StreamBuffer) WriteAt(p []byte, off int64) (n int, err error) {
 func (b *StreamBuffer) advanceWritable() int {
 	toWrite := 0
 
+	// Trace through our available sequential writes to figure out how much
+	// data can be flushed to the writer. Each written chunk should map to the
+	// potential next chunk that has been written.
 	for {
 		newOffset, ok := b.writtenChunks[b.flushedOffset]
 		if !ok {
@@ -120,42 +165,53 @@ func (b *StreamBuffer) Flush() []byte {
 	b.Lock()
 	defer b.Unlock()
 
-	// calculate normalizedFlushOffset before advancing writeable state
+	// normalizedFlushOffset is the difference between the offset of the
+	// non-flushed data and the current offset of our overarching buffer
 	normalizedFlushedOffset := b.flushedOffset - b.offset
 
+	// If there's no data to write, then we don't need to proceed.
 	toWrite := b.advanceWritable()
 	if toWrite == 0 {
 		return nil
 	}
 
 	out := make([]byte, toWrite)
-	written := 0
+	var written int
 
 	for i := 0; i < b.buffers.Len(); i++ {
 		buf := b.buffers.Value.(*bytes.Buffer)
 		data := buf.Bytes()
 
+		// bufferStart is the normalized offset of the buf above relative to
+		// the offset of the overall buffer when we entered this function.
 		bufferStart := i * b.bufferSize
-		bufferEnd := (i + 1) * b.bufferSize
 
-		bufferCopyOffset := normalizedFlushedOffset + int64(written-bufferStart)
+		// copyStart and copyEnd are the source boundaries of the copy
+		// operation from the current buffer like [copyStart, copyEnd)
+		copyStart := int(normalizedFlushedOffset + int64(written) - int64(bufferStart))
+		copyEnd := int(copyStart + toWrite - written)
 
-		toWriteFromBuffer := toWrite - written
-		if toWrite > bufferEnd-int(bufferCopyOffset) {
-			toWriteFromBuffer = bufferEnd - int(bufferCopyOffset)
+		// Don't copy more than the size of the current buffer. If we're going
+		// to go beyond, limit it. We'll be sure to write to the next buffer
+		// next.
+		if copyEnd > b.bufferSize {
+			copyEnd = b.bufferSize
 		}
 
-		copy(out[written:written+toWriteFromBuffer], data[bufferCopyOffset:int(bufferCopyOffset)+toWriteFromBuffer])
+		copyLength := copyEnd - copyStart
+		copy(out[written:copyLength+written], data[copyStart:copyEnd])
 
-		written += toWriteFromBuffer
-
-		// reset data in this flushed buffer and advance
+		// This buffer is fully flushed, so reset its data and advance the
+		// overarching buffer to the next one.
 		if b.flushedOffset >= b.offset+int64(b.bufferSize) {
 			buf.Reset()
 			b.buffers = b.buffers.Next()
 			b.offset += int64(b.bufferSize)
 		}
 
+		// Advance to the next chunk if more data is available to be written or
+		// quit out if not.
+		written += copyLength
 		if written >= toWrite {
 			break
 		}
