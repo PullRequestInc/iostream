@@ -101,6 +101,18 @@ func TestWritingTwiceAcrossTwoBuffersOutOfOrder(t *testing.T) {
 	require.Equal(t, "", string(sb.Flush()))
 }
 
+func TestBufferedWriteTwiceAcrossTwoBuffersInOrderPastSecond(t *testing.T) {
+	sb := iostream.NewStreamBuffer(3, 2)
+	written, err := sb.WriteAt([]byte("ab"), 0)
+	require.NoError(t, err)
+	require.Equal(t, 2, written)
+	written, err = sb.WriteAt([]byte("cde"), 2)
+	require.NoError(t, err)
+	require.Equal(t, 3, written)
+	require.Equal(t, "abcde", string(sb.Flush()))
+	require.Equal(t, "", string(sb.Flush()))
+}
+
 func TestWritingOnRotatedBuffer(t *testing.T) {
 	sb := iostream.NewStreamBuffer(2, 2)
 	written, err := sb.WriteAt([]byte("abcd"), 0)

@@ -46,6 +46,7 @@ type writeAtResp struct {
 func (s *WriterAtStream) start() {
 	// backedUp holds byteChunks that are beyond our buffer and are currently being blocked
 	// until the buffer grows to accomodate them as a backpressure mechanism.
+	// TODO: Use linked list?
 	var backedUp []*byteChunk
 
 	for {
