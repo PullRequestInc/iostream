@@ -66,13 +66,13 @@ func NewStreamBuffer(bufferCount int, bufferSize int) *StreamBuffer {
 
 // WriteAt implements io.WriterAt interface
 func (b *StreamBuffer) WriteAt(p []byte, off int64) (n int, err error) {
-	log.Printf("write at %08x: %08x", off, len(p))
 	if len(p) == 0 {
 		return 0, nil
 	}
 
 	b.Lock()
 	defer b.Unlock()
+	log.Printf("write at %08x: %08x", off, len(p))
 
 	// Check to see if the current write can fit into our current buffer window
 	// denoted by [b.offset, b.offset + buffer length * buffer size)
@@ -176,6 +176,7 @@ func (b *StreamBuffer) Flush() []byte {
 	if toWrite == 0 {
 		return nil
 	}
+	log.Printf("flush from %08x: %08x", b.offset, toWrite)
 
 	out := make([]byte, toWrite)
 	var written int
