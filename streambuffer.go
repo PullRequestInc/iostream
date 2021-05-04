@@ -81,7 +81,7 @@ func (b *StreamBuffer) WriteAt(p []byte, off int64) (n int, err error) {
 	if off+int64(len(p)) > b.offset+int64(b.buffers.Len())*int64(b.bufferSize) {
 		return 0, ErrAfterBounds
 	}
-	log.Printf("write at %08x: %08x", off, len(p))
+	log.Printf("write at %08x: %08x -> %08x", off, len(p), off+int64(len(p)))
 
 	// normalizedOffset is the offset of the write relative to the first buffer
 	// in our ring of buffers
@@ -177,7 +177,7 @@ func (b *StreamBuffer) Flush() []byte {
 	if toWrite == 0 {
 		return nil
 	}
-	log.Printf("flush from %08x: %08x", off, toWrite)
+	log.Printf("flush from %08x: %08x -> %08x", off, toWrite, off+int64(toWrite))
 
 	out := make([]byte, toWrite)
 	var written int
