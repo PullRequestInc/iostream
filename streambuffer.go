@@ -72,7 +72,6 @@ func (b *StreamBuffer) WriteAt(p []byte, off int64) (n int, err error) {
 
 	b.Lock()
 	defer b.Unlock()
-	log.Printf("write at %08x: %08x", off, len(p))
 
 	// Check to see if the current write can fit into our current buffer window
 	// denoted by [b.offset, b.offset + buffer length * buffer size)
@@ -82,6 +81,7 @@ func (b *StreamBuffer) WriteAt(p []byte, off int64) (n int, err error) {
 	if off+int64(len(p)) > b.offset+int64(b.buffers.Len())*int64(b.bufferSize) {
 		return 0, ErrAfterBounds
 	}
+	log.Printf("write at %08x: %08x", off, len(p))
 
 	// normalizedOffset is the offset of the write relative to the first buffer
 	// in our ring of buffers
