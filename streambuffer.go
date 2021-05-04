@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/ring"
 	"errors"
+	"log"
 	"sync"
 )
 
@@ -65,6 +66,7 @@ func NewStreamBuffer(bufferCount int, bufferSize int) *StreamBuffer {
 
 // WriteAt implements io.WriterAt interface
 func (b *StreamBuffer) WriteAt(p []byte, off int64) (n int, err error) {
+	log.Printf("write at %08x: %08x", off, len(p))
 	if len(p) == 0 {
 		return 0, nil
 	}
