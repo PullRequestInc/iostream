@@ -169,6 +169,7 @@ func (b *StreamBuffer) Flush() []byte {
 
 	// normalizedFlushOffset is the difference between the offset of the
 	// non-flushed data and the current offset of our overarching buffer
+	off := b.flushedOffset
 	normalizedFlushedOffset := b.flushedOffset - b.offset
 
 	// If there's no data to write, then we don't need to proceed.
@@ -176,7 +177,7 @@ func (b *StreamBuffer) Flush() []byte {
 	if toWrite == 0 {
 		return nil
 	}
-	log.Printf("flush from %08x: %08x", b.offset, toWrite)
+	log.Printf("flush from %08x: %08x", off, toWrite)
 
 	out := make([]byte, toWrite)
 	var written int
