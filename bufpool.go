@@ -19,7 +19,7 @@ type bufPool struct {
 func NewBufPool(bytesPerBuffer int) BufPool {
 	pool := &sync.Pool{
 		New: func() interface{} {
-			buf := make([]byte, bytesPerBuffer)
+			buf := make([]byte, 0, bytesPerBuffer)
 			return bytes.NewBuffer(buf)
 		},
 	}
