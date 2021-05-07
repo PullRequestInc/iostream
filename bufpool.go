@@ -33,5 +33,6 @@ func (p *bufPool) Get() *bytes.Buffer {
 }
 
 func (p *bufPool) Put(buf *bytes.Buffer) {
+	buf.Reset()
 	p.pool.Put(buf)
 }

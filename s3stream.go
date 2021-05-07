@@ -1,0 +1,268 @@
+package iostream
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"sort"
+	"sync"
+	"time"
+)
+
+// S3WriterAtStream is meant to convert an io.WriterAt to an io.Writer using an in memory buffer.
+// It is an optimized version of WriterAtStream meant specifically for working s3 downloader and
+// makes several assumptions specific to that usage.
+type S3WriterAtStream struct {
+	bufferPool        BufPool
+	writer            io.Writer
+	newChunks         chan *byteChunk
+	closed            chan int // signalled when Close is called
+	done              chan int // signalled after close has been completed
+	bufferSize        int
+	numBuffers        int
+	err               error
+	lastWrittenOffset int64
+	offsetLock        *sync.RWMutex
+}
+
+// OpenS3WriterAtStream opened a WriterAtStream. The stream should be closed by the caller to clean up
+// resources. If an error occurs, all subsequent WriteAts will begin to error out.
+func OpenS3WriterAtStream(writer io.Writer, bufferPool BufPool, numBuffers, bufferSize int) *S3WriterAtStream {
+	stream := &S3WriterAtStream{
+		bufferPool: bufferPool,
+		writer:     writer,
+		newChunks:  make(chan *byteChunk),
+		closed:     make(chan int),
+		done:       make(chan int),
+		bufferSize: bufferSize,
+		numBuffers: numBuffers,
+		offsetLock: new(sync.RWMutex),
+	}
+	go stream.start()
+	return stream
+}
+
+type toWriteChunk struct {
+	buf    *bytes.Buffer
+	offset int64
+}
+
+type wroteChunk struct {
+	buf    *bytes.Buffer
+	offset int64
+	err    error
+}
+
+func (s *S3WriterAtStream) writeChunkIfNeeded(doneWriting chan *wroteChunk, chunk *toWriteChunk) (successfullyWrote bool) {
+	// if this is the first block, or the next block that we are supposed to write, then go ahead and write it
+	if s.lastWrittenOffset == 0 && chunk.offset == 0 || s.lastWrittenOffset == chunk.offset-int64(s.bufferSize) {
+		var written int
+		toWriteBytes := chunk.buf.Bytes()
+		for len(toWriteBytes) > written {
+			w, err := s.writer.Write(toWriteBytes)
+			if err != nil {
+				wrote := &wroteChunk{
+					buf: chunk.buf,
+					err: err,
+				}
+				doneWriting <- wrote
+				return false
+			}
+			written += w
+		}
+
+		// update the last written offset
+		s.offsetLock.Lock()
+		s.lastWrittenOffset = chunk.offset
+		s.offsetLock.Unlock()
+
+		// notify done writing without errors
+		wrote := &wroteChunk{
+			buf: chunk.buf,
+		}
+		doneWriting <- wrote
+		return true
+	}
+	return false
+}
+
+func (s *S3WriterAtStream) start() {
+	toWrite := make(chan *toWriteChunk, s.numBuffers)
+	doneWriting := make(chan *wroteChunk, s.numBuffers)
+
+	// spin off a writer worker thread
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		var pendingWrites []*toWriteChunk
+
+		for {
+			select {
+			case chunk := <-toWrite:
+				if chunk == nil {
+					// done/channel closed
+					return
+				}
+
+				successfullyWrote := s.writeChunkIfNeeded(doneWriting, chunk)
+				if !successfullyWrote {
+					// add this chunk to the pendingWrites if we weren't able to write it yet and we'll try again
+					// later after a write succeeds.
+					pendingWrites = append(pendingWrites, chunk)
+
+					// TODO: would be potentially faster with a min heap but I'm lazy and there are only going to
+					// be small number of items in here (should be less than or equal to numBuffers)
+					sort.SliceStable(pendingWrites, func(i, j int) bool {
+						return pendingWrites[i].offset < pendingWrites[j].offset
+					})
+					break
+				}
+
+				// if we successfully wrote, then lets try the pending chunks
+				var removedOffsets map[int64]bool
+				for _, c := range pendingWrites {
+					successfullyWrote := s.writeChunkIfNeeded(doneWriting, c)
+					if !successfullyWrote {
+						break
+					}
+					removedOffsets[c.offset] = true
+				}
+
+				// remove the pending chunks that we successfully processed
+				newPendingWrites := make([]*toWriteChunk, 0, len(pendingWrites)-len(removedOffsets))
+				for _, c := range pendingWrites {
+					if removedOffsets[c.offset] {
+						continue
+					}
+					newPendingWrites = append(pendingWrites, c)
+				}
+				pendingWrites = newPendingWrites
+			}
+		}
+	}()
+
+	var latestChunk *byteChunk
+	var chunksBeingWritten int
+
+	for {
+		select {
+		case <-s.closed:
+			closedErr := errors.New("WriterAtStream Closed")
+			// set the error in case any more writes try to come in
+			close(toWrite)
+
+			// wait for the writer to complete
+			wg.Wait()
+
+			close(doneWriting)
+			close(s.newChunks)
+
+			for chunk := range s.newChunks {
+				chunk.response <- &writeAtResp{
+					err: closedErr,
+				}
+			}
+
+			for chunk := range doneWriting {
+				if chunk != nil {
+					s.bufferPool.Put(chunk.buf)
+				}
+			}
+
+			close(s.done)
+			return
+		case chunk := <-s.newChunks:
+			// copy to internal buffer since once the WriteAt completes to the caller, they will likely
+			// expect to be able to re-use their own buffer.
+			buf := s.bufferPool.Get()
+			copy(buf.Bytes(), chunk.bytes)
+
+			// since we have a new chunk, we can unblock the previous latest one. this is mainly
+			// just to prevent all of the WriteAts from continuing before the last write has occurred
+			// similar to the behavior if this was a normal file or buffer being written to.
+			if latestChunk != nil {
+				latestChunk.response <- &writeAtResp{s.err}
+				latestChunk = chunk
+			}
+
+			chunksBeingWritten++
+
+			writeChunk := &toWriteChunk{
+				buf:    buf,
+				offset: chunk.offset,
+			}
+			toWrite <- writeChunk
+		case chunk := <-doneWriting:
+			chunksBeingWritten--
+			s.bufferPool.Put(chunk.buf)
+			if latestChunk != nil && chunksBeingWritten == 0 {
+				// finished writing the latest chunk, unblock the write on it and notify of any
+				// errors that might have occurred.
+				latestChunk.response <- &writeAtResp{chunk.err}
+				latestChunk = nil
+			}
+			if s.err == nil {
+				// set the "global" error in case any more writes try to come in so we can stop processing them
+				s.err = chunk.err
+			}
+		}
+	}
+}
+
+// Close must be called to cleanup resources and finish flushing data to writer
+func (s *S3WriterAtStream) Close() {
+	close(s.closed)
+	<-s.done
+}
+
+// WriteAt implements the io.WriterAt interface
+func (s *S3WriterAtStream) WriteAt(p []byte, off int64) (n int, err error) {
+	if off%int64(s.bufferSize) != 0 {
+		// this s3writerAtStream expects to only received blocks of exactly the buffersize
+		// due to optimizations in the implementation.
+		return 0, fmt.Errorf("unexpected offset %q not multiple of %q", off, s.bufferSize)
+	}
+	if len(p) > s.bufferSize {
+		// this s3writerAtStream expects to only received blocks of exactly the buffersize
+		// due to optimizations in the implementation. The last block may be smaller than the buffer size,
+		// but none should be larger.
+		return 0, fmt.Errorf("size of buffer being written %q is greated than bufferSize %q", len(p), s.bufferSize)
+	}
+
+	for {
+		if s.err != nil {
+			return 0, s.err
+		}
+
+		s.offsetLock.RLock()
+		lastWrittenOffset := s.lastWrittenOffset
+		s.offsetLock.RUnlock()
+
+		// if we are attempting to write too far ahead in the buffer, then block and try again in a bit.
+		// this will put backpressure on threads that are too far ahead for our "streaming buffer".
+		allowedOffsetRange := s.bufferSize * s.bufferSize
+		if off > lastWrittenOffset+int64(allowedOffsetRange) {
+			time.Sleep(time.Nanosecond * 10)
+			continue
+		}
+		break
+	}
+
+	// we've verified that this chunk is as is expected and within the range we can buffer, continue to write
+	response := make(chan *writeAtResp)
+	defer close(response)
+
+	chunk := &byteChunk{
+		bytes:    p,
+		offset:   off,
+		response: response,
+	}
+	s.newChunks <- chunk
+
+	// this response will block until either this write is completed or another write comes in after this one.
+	r := <-response
+	return len(p), r.err
+}
