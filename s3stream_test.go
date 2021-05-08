@@ -195,4 +195,5 @@ func TestS3WriteMultipleChunksOutOfOrder(t *testing.T) {
 			}
 		}()
 	}
+	wg.Wait()
 }
