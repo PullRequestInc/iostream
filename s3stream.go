@@ -63,19 +63,13 @@ type wroteChunk struct {
 func (s *S3WriterAtStream) writeChunkIfNeeded(doneWriting chan *wroteChunk, chunk *toWriteChunk) (successfullyWrote bool) {
 	// if this is the next block that we are supposed to write, then go ahead and write it
 	if s.lastWrittenOffset == chunk.offset-int64(s.bufferSize) {
-		var written int
-		toWriteBytes := chunk.buf.Bytes()
-		for len(toWriteBytes) > written {
-			w, err := s.writer.Write(toWriteBytes)
-			if err != nil {
-				wrote := &wroteChunk{
-					buf: chunk.buf,
-					err: err,
-				}
-				doneWriting <- wrote
-				return false
+		if _, err := io.Copy(s.writer, chunk.buf); err != nil {
+			wrote := &wroteChunk{
+				buf: chunk.buf,
+				err: err,
 			}
-			written += w
+			doneWriting <- wrote
+			return false
 		}
 
 		// update the last written offset
