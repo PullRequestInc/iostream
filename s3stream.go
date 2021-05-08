@@ -12,7 +12,12 @@ import (
 
 // S3WriterAtStream is meant to convert an io.WriterAt to an io.Writer using an in memory buffer.
 // It is an optimized version of WriterAtStream meant specifically for working s3 downloader and
-// makes several assumptions specific to that usage.
+// makes several assumptions specific to that usage:
+// - "numBuffers" is greater than or equal to the number of concurrent workers in the downloader
+// - all chunks written will be of "bufferSize" except the last chunk which can be smaller
+// - all chunks will be written with offset multiples of "bufferSize"
+// - the chunks are fed to the workers in ascending order
+// - the same chunks/offsets are not attempted to be written more than once
 type S3WriterAtStream struct {
 	bufferPool        BufPool
 	writer            io.Writer
@@ -26,8 +31,8 @@ type S3WriterAtStream struct {
 	offsetLock        *sync.RWMutex
 }
 
-// OpenS3WriterAtStream opened a WriterAtStream. The stream should be closed by the caller to clean up
-// resources. If an error occurs, all subsequent WriteAts will begin to error out.
+// OpenS3WriterAtStream opens a S3WriterAtStream. The stream should be closed by the caller to clean up
+// resources. If an error occurs, all subsequent WriteAts will begin to error out with the same error.
 func OpenS3WriterAtStream(writer io.Writer, bufferPool BufPool, numBuffers, bufferSize int) *S3WriterAtStream {
 	stream := &S3WriterAtStream{
 		bufferPool:        bufferPool,
@@ -54,6 +59,7 @@ type wroteChunk struct {
 	err error
 }
 
+// see if this chunk is the next one in line that needs to be written, and if so write it.
 func (s *S3WriterAtStream) writeChunkIfNeeded(doneWriting chan *wroteChunk, chunk *toWriteChunk) (successfullyWrote bool) {
 	// if this is the next block that we are supposed to write, then go ahead and write it
 	if s.lastWrittenOffset == chunk.offset-int64(s.bufferSize) {
@@ -187,9 +193,10 @@ func (s *S3WriterAtStream) start() {
 			}
 			seenOffsets[chunk.offset] = true
 
+			// get a recycled buffer
+			buf := s.bufferPool.Get()
 			// copy to internal buffer since once the WriteAt completes to the caller, they will likely
 			// expect to be able to re-use their own buffer.
-			buf := s.bufferPool.Get()
 			buf.Write(chunk.bytes)
 
 			// since we have a new chunk, we can unblock the previous latest one. this is mainly
@@ -209,7 +216,10 @@ func (s *S3WriterAtStream) start() {
 			toWrite <- writeChunk
 		case chunk := <-doneWriting:
 			chunksBeingWritten--
+
+			// recycle the buffer
 			s.bufferPool.Put(chunk.buf)
+
 			if latestChunk != nil && chunksBeingWritten == 0 {
 				// finished writing the latest chunk, unblock the write on it and notify of any
 				// errors that might have occurred.

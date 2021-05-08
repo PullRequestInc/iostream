@@ -127,9 +127,11 @@ func TestS3WriteMultipleChunksOutOfOrder(t *testing.T) {
 		"00",
 	}
 
-	run := func(numWorkers int) {
+	// this test simulates the behavior of the s3 downloader with concurrent workers pulling chunks off
+	// with random amounts of delay in "downloading"
+	run := func(numWorkers, numBuffers int) {
 		writer := new(bytes.Buffer)
-		stream := iostream.OpenS3WriterAtStream(writer, pool, numWorkers, bufSize)
+		stream := iostream.OpenS3WriterAtStream(writer, pool, numBuffers, bufSize)
 		defer stream.Close()
 
 		wg := sync.WaitGroup{}
@@ -186,7 +188,10 @@ func TestS3WriteMultipleChunksOutOfOrder(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for numWorkers := 1; numWorkers < len(chunks)+1; numWorkers++ {
-				run(numWorkers)
+				// set the number of buffers to between numWorkers and 2x numWorkers
+				for numBuffers := numWorkers; numBuffers < numWorkers*2; numBuffers++ {
+					run(numWorkers, numBuffers)
+				}
 			}
 		}()
 	}
