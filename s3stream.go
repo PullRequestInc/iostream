@@ -55,7 +55,6 @@ type toWriteChunk struct {
 }
 
 type wroteChunk struct {
-	buf *bytes.Buffer
 	err error
 }
 
@@ -64,8 +63,9 @@ func (s *S3WriterAtStream) writeChunkIfNeeded(doneWriting chan *wroteChunk, chun
 	// if this is the next block that we are supposed to write, then go ahead and write it
 	if s.lastWrittenOffset == chunk.offset-int64(s.bufferSize) {
 		if _, err := io.Copy(s.writer, chunk.buf); err != nil {
+			// recycle buffer
+			s.bufferPool.Put(chunk.buf)
 			wrote := &wroteChunk{
-				buf: chunk.buf,
 				err: err,
 			}
 			doneWriting <- wrote
@@ -77,10 +77,10 @@ func (s *S3WriterAtStream) writeChunkIfNeeded(doneWriting chan *wroteChunk, chun
 		s.lastWrittenOffset = chunk.offset
 		s.offsetLock.Unlock()
 
+		// recycle buffer
+		s.bufferPool.Put(chunk.buf)
 		// notify done writing without errors
-		wrote := &wroteChunk{
-			buf: chunk.buf,
-		}
+		wrote := &wroteChunk{}
 		doneWriting <- wrote
 		return true
 	}
@@ -91,13 +91,13 @@ func (s *S3WriterAtStream) start() {
 	toWrite := make(chan *toWriteChunk, s.numBuffers)
 	doneWriting := make(chan *wroteChunk, s.numBuffers)
 
+	var pendingWrites []*toWriteChunk
+
 	// spin off a writer worker thread
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-
-		var pendingWrites []*toWriteChunk
 
 		for {
 			select {
@@ -164,17 +164,22 @@ func (s *S3WriterAtStream) start() {
 			close(doneWriting)
 			close(s.newChunks)
 
+			// clear out channels
+
 			for chunk := range s.newChunks {
 				chunk.response <- &writeAtResp{
 					err: closedErr,
 				}
 			}
 
-			for chunk := range doneWriting {
-				if chunk != nil {
-					s.bufferPool.Put(chunk.buf)
-				}
+			for range doneWriting {
 			}
+
+			// recycle any outstanding buffers in pendingWrites
+			for _, chunk := range pendingWrites {
+				s.bufferPool.Put(chunk.buf)
+			}
+			pendingWrites = nil
 
 			close(s.done)
 			return
@@ -210,9 +215,6 @@ func (s *S3WriterAtStream) start() {
 			toWrite <- writeChunk
 		case chunk := <-doneWriting:
 			chunksBeingWritten--
-
-			// recycle the buffer
-			s.bufferPool.Put(chunk.buf)
 
 			if latestChunk != nil && chunksBeingWritten == 0 {
 				// finished writing the latest chunk, unblock the write on it and notify of any
