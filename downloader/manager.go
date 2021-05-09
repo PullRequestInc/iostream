@@ -238,7 +238,9 @@ func (d *downloader) writeOutChunkIfNeeded(chunk *dlchunk) (wroteOut bool) {
 
 	// if this chunk starts where we last flushed, then we are good to flush it
 	if chunk.start == d.flushed {
+		log.Println("flushing chunk", chunk.start)
 		n, err := io.Copy(d.w, chunk.buf)
+		log.Println("flushed", chunk.start)
 		if err != nil {
 			d.setErr(err)
 		}
@@ -277,6 +279,10 @@ func (d *downloader) download() (n int64, err error) {
 			chunk := <-toWrite
 			if chunk == nil {
 				// channel empty
+				for _, c := range pendingWrites {
+					// replace/reset recycled buffer since we are cleaning up
+					d.cfg.BufPool.Put(chunk.buf)
+				}
 				return
 			}
 
@@ -306,6 +312,7 @@ func (d *downloader) download() (n int64, err error) {
 				}
 				if didWrite := d.writeOutChunkIfNeeded(chunk); !didWrite {
 					didNotWrite = true
+					newPendingWrites = append(newPendingWrites, chunk)
 				}
 			}
 			pendingWrites = newPendingWrites
@@ -390,7 +397,7 @@ func (d *downloader) downloadPart(ch chan dlchunk, toWrite chan *dlchunk) {
 			// and check again before proceeding
 			flushed := d.getFlushed()
 			if flushed+allowedBuffered < chunk.start {
-				time.Sleep(time.Microsecond * 100)
+				time.Sleep(time.Millisecond * 1)
 			}
 		}
 
