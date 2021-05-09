@@ -281,7 +281,7 @@ func (d *downloader) download() (n int64, err error) {
 				// channel empty
 				for _, c := range pendingWrites {
 					// replace/reset recycled buffer since we are cleaning up
-					d.cfg.BufPool.Put(chunk.buf)
+					d.cfg.BufPool.Put(c.buf)
 				}
 				return
 			}
