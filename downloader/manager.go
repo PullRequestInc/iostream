@@ -234,6 +234,8 @@ func (d *downloader) writeOutChunkIfNeeded(chunk *dlchunk) (wroteOut bool) {
 		return false
 	}
 
+	log.Println("trying to write out chunk", chunk.start, d.flushed)
+
 	// if this chunk starts where we last flushed, then we are good to flush it
 	if chunk.start == d.flushed {
 		n, err := io.Copy(d.w, chunk.buf)
@@ -460,7 +462,7 @@ func (d *downloader) downloadChunk(chunk dlchunk, toWrite chan *dlchunk) error {
 
 	d.incrWritten(n)
 
-	if err != nil {
+	if err == nil {
 		toWrite <- &chunk
 	}
 
