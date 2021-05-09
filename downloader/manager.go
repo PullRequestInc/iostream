@@ -398,7 +398,10 @@ func (d *downloader) downloadPart(ch chan dlchunk, toWrite chan *dlchunk) {
 			flushed := d.getFlushed()
 			if flushed+allowedBuffered < chunk.start {
 				time.Sleep(time.Millisecond * 1)
+				continue
 			}
+			// otherwise continue on to download
+			break
 		}
 
 		if d.getErr() != nil {
