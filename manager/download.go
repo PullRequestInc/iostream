@@ -123,17 +123,20 @@ func WithDownloaderClientOptions(opts ...func(*s3.Options)) func(*Downloader) {
 //	downloader := manager.NewDownloader(client, func(d *manager.Downloader) {
 //		d.PartSize = 64 * 1024 * 1024 // 64MB per part
 //	})
-func NewDownloader(c manager.DownloadAPIClient, bufPool iostream.BufPool, options ...func(*Downloader)) *Downloader {
+func NewDownloader(c manager.DownloadAPIClient, options ...func(*Downloader)) *Downloader {
 	d := &Downloader{
 		S3:                 c,
 		PartSize:           DefaultDownloadPartSize,
 		PartBodyMaxRetries: DefaultPartBodyMaxRetries,
 		Concurrency:        DefaultDownloadConcurrency,
 		MaxBufferedParts:   DefaultMaxBufferedParts,
-		BufPool:            bufPool,
 	}
 	for _, option := range options {
 		option(d)
+	}
+
+	if d.BufPool == nil {
+		d.BufPool = iostream.NewBufPool(int(d.PartSize))
 	}
 
 	return d
