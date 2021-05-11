@@ -32,7 +32,7 @@ const DefaultDownloadPartSize = 1024 * 1024 * 5
 const DefaultDownloadConcurrency = 5
 
 // DefaultMaxBufferedParts is the default number of buffered parts internal to the downloader
-const DefaultMaxBufferedParts = 5
+const DefaultMaxBufferedParts = 8
 
 // DefaultPartBodyMaxRetries is the default number of retries to make when a part fails to upload.
 const DefaultPartBodyMaxRetries = 3
@@ -448,6 +448,7 @@ func (d *downloader) downloadChunk(chunk dlchunk, toWrite chan *dlchunk) error {
 		n, err = d.tryDownloadChunk(in, &chunk)
 
 		if err == nil {
+			toWrite <- &chunk
 			break
 		}
 
@@ -465,16 +466,10 @@ func (d *downloader) downloadChunk(chunk dlchunk, toWrite chan *dlchunk) error {
 			return err
 		}
 
-		chunk.cur = 0
-
 		log.Printf("object part body download interrupted %s, err, %v, retrying attempt %d", aws.ToString(in.Key), err, retry)
 	}
 
 	d.incrWritten(n)
-
-	if err == nil {
-		toWrite <- &chunk
-	}
 
 	return err
 }
@@ -593,14 +588,7 @@ type dlchunk struct {
 // Write wraps io.WriterAt for the dlchunk, writing from the dlchunk's start
 // position to its end (or EOF).
 func (c *dlchunk) Write(p []byte) (n int, err error) {
-	if c.cur >= c.size {
-		return 0, io.EOF
-	}
-
-	// n, err = c.w.WriteAt(p, c.start+c.cur)
-	n, err = c.buf.Write(p)
-	c.cur += int64(n)
-	return
+	return c.buf.Write(p)
 }
 
 // ByteRange returns a HTTP Byte-Range header value that should be used by the
