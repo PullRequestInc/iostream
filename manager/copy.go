@@ -1,4 +1,5 @@
-package awsutil
+// This file was copied exactly from https://github.com/aws/aws-sdk-go-v2/blob/b7d8e15425d2f86a0596e8d7db2e33bf382a21dd/internal/awsutil/copy.go
+package manager
 
 import (
 	"io"

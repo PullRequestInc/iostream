@@ -1,20 +1,29 @@
+// This file was copied and then modified from:
+// https://github.com/aws/aws-sdk-go-v2/blob/b7d8e15425d2f86a0596e8d7db2e33bf382a21dd/feature/s3/manager/download.go
+// This version of the manager is built to work with io.Writer instead of io.WriterAt.
+// It achieves this by recycling some larger internal buffers and stalling out downloads that are
+// too far ahead in the stream until the ones at the start catching up.
 package manager
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/PullRequestInc/iostream"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/middleware"
-	"github.com/aws/aws-sdk-go-v2/internal/awsutil"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/smithy-go/logging"
 )
 
 const userAgentKey = "s3-transfer"
@@ -26,6 +35,9 @@ const DefaultDownloadPartSize = 1024 * 1024 * 5
 // DefaultDownloadConcurrency is the default number of goroutines to spin up
 // when using Download().
 const DefaultDownloadConcurrency = 5
+
+// DefaultMaxBufferedParts is the default number of buffered parts internal to the downloader
+const DefaultMaxBufferedParts = 8
 
 // DefaultPartBodyMaxRetries is the default number of retries to make when a part fails to upload.
 const DefaultPartBodyMaxRetries = 3
@@ -56,9 +68,6 @@ type Downloader struct {
 	// PartBodyMaxRetries is the number of retry attempts to make for failed part uploads
 	PartBodyMaxRetries int
 
-	// Logger to send logging messages to
-	Logger logging.Logger
-
 	// Enable Logging of part download retry attempts
 	LogInterruptedDownloads bool
 
@@ -66,24 +75,22 @@ type Downloader struct {
 	// If this is set to zero, the DefaultDownloadConcurrency value will be used.
 	//
 	// Concurrency of 1 will download the parts sequentially.
-	//
-	// Concurrency is ignored if the Range input parameter is provided.
 	Concurrency int
 
+	// MaxBufferedParts should be greater than or equal to Concurrency
+	// It represents how many PartSize buffers could potentially be buffered while
+	// waiting on the next bytes to write to the writer.
+	MaxBufferedParts int
+
 	// An S3 client to use when performing downloads.
-	S3 DownloadAPIClient
+	S3 manager.DownloadAPIClient
 
 	// List of client options that will be passed down to individual API
 	// operation requests made by the downloader.
 	ClientOptions []func(*s3.Options)
 
-	// Defines the buffer strategy used when downloading a part.
-	//
-	// If a WriterReadFromProvider is given the Download manager
-	// will pass the io.WriterAt of the Download request to the provider
-	// and will use the returned WriterReadFrom from the provider as the
-	// destination writer when copying from http response body.
-	BufferProvider WriterReadFromProvider
+	// buffer pool containing bytes.Buffers
+	BufPool iostream.BufPool
 }
 
 // WithDownloaderClientOptions appends to the Downloader's API request options.
@@ -116,13 +123,14 @@ func WithDownloaderClientOptions(opts ...func(*s3.Options)) func(*Downloader) {
 //	downloader := manager.NewDownloader(client, func(d *manager.Downloader) {
 //		d.PartSize = 64 * 1024 * 1024 // 64MB per part
 //	})
-func NewDownloader(c DownloadAPIClient, options ...func(*Downloader)) *Downloader {
+func NewDownloader(c manager.DownloadAPIClient, bufPool iostream.BufPool, options ...func(*Downloader)) *Downloader {
 	d := &Downloader{
 		S3:                 c,
 		PartSize:           DefaultDownloadPartSize,
 		PartBodyMaxRetries: DefaultPartBodyMaxRetries,
 		Concurrency:        DefaultDownloadConcurrency,
-		BufferProvider:     defaultDownloadBufferProvider(),
+		MaxBufferedParts:   DefaultMaxBufferedParts,
+		BufPool:            bufPool,
 	}
 	for _, option := range options {
 		option(d)
@@ -131,47 +139,13 @@ func NewDownloader(c DownloadAPIClient, options ...func(*Downloader)) *Downloade
 	return d
 }
 
-// Download downloads an object in S3 and writes the payload into w
-// using concurrent GET requests. The n int64 returned is the size of the object downloaded
-// in bytes.
-//
-// DownloadWithContext is the same as Download with the additional support for
-// Context input parameters. The Context must not be nil. A nil Context will
-// cause a panic. Use the Context to add deadlining, timeouts, etc. The
-// DownloadWithContext may create sub-contexts for individual underlying
-// requests.
-//
-// Additional functional options can be provided to configure the individual
-// download. These options are copies of the Downloader instance Download is
-// called from. Modifying the options will not impact the original Downloader
-// instance. Use the WithDownloaderClientOptions helper function to pass in request
-// options that will be applied to all API operations made with this downloader.
-//
-// The w io.WriterAt can be satisfied by an os.File to do multipart concurrent
-// downloads, or in memory []byte wrapper using aws.WriteAtBuffer. In case you download
-// files into memory do not forget to pre-allocate memory to avoid additional allocations
-// and GC runs.
-//
-// Example:
-//	// pre-allocate in memory buffer, where headObject type is *s3.HeadObjectOutput
-//	buf := make([]byte, int(headObject.ContentLength))
-//	// wrap with aws.WriteAtBuffer
-//	w := s3manager.NewWriteAtBuffer(buf)
-//	// download file into the memory
-//	numBytesDownloaded, err := downloader.Download(ctx, w, &s3.GetObjectInput{
-//		Bucket: aws.String(bucket),
-//		Key:    aws.String(item),
-//	})
-//
-// Specifying a Downloader.Concurrency of 1 will cause the Downloader to
-// download the parts from S3 sequentially.
+// Download downloads an object in S3 and writes the payload into w using concurrent
+// GET requests. The n int64 returned is the size of the object downloaded/ in bytes.
 //
 // It is safe to call this method concurrently across goroutines.
 //
-// If the GetObjectInput's Range value is provided that will cause the downloader
-// to perform a single GetObjectInput request for that object's range. This will
-// caused the part size, and concurrency configurations to be ignored.
-func (d Downloader) Download(ctx context.Context, w io.WriterAt, input *s3.GetObjectInput, options ...func(*Downloader)) (n int64, err error) {
+// GetObjectInputs with the "Range" value provided are not allowed and will return an error.
+func (d Downloader) Download(ctx context.Context, w io.Writer, input *s3.GetObjectInput, options ...func(*Downloader)) (n int64, err error) {
 	if err := validateSupportedARNType(aws.ToString(input.Bucket)); err != nil {
 		return 0, err
 	}
@@ -189,9 +163,6 @@ func (d Downloader) Download(ctx context.Context, w io.WriterAt, input *s3.GetOb
 	for _, option := range options {
 		option(&impl.cfg)
 	}
-
-	// Ensures we don't need nil checks later on
-	impl.cfg.Logger = logging.WithContext(ctx, impl.cfg.Logger)
 
 	impl.partBodyMaxRetries = d.PartBodyMaxRetries
 
@@ -213,17 +184,43 @@ type downloader struct {
 	cfg Downloader
 
 	in *s3.GetObjectInput
-	w  io.WriterAt
+	w  io.Writer
 
 	wg sync.WaitGroup
-	m  sync.Mutex
+	m  sync.RWMutex
 
 	pos        int64
 	totalBytes int64
-	written    int64
-	err        error
+	// total bytes written to internal buffers
+	written int64
+	// flushed/written to 'w' writer
+	flushed int64
+	err     error
 
 	partBodyMaxRetries int
+}
+
+func (d *downloader) writeOutChunkIfNeeded(chunk *dlchunk) (wroteOut bool) {
+	if chunk.start < d.flushed {
+		// we received an unexpected old chunk
+		log.Printf("received unexpected old chunk starting at %d, after flushing %d", chunk.start, d.flushed)
+		return false
+	}
+
+	// if this chunk starts where we last flushed, then we are good to flush it
+	if chunk.start == d.flushed {
+		n, err := io.Copy(d.w, chunk.buf)
+		if err != nil {
+			d.setErr(err)
+		}
+		d.incrFlushed(n)
+
+		// replace/reset recycled buffer after finishing writing it
+		d.cfg.BufPool.Put(chunk.buf)
+		return true
+	}
+
+	return false
 }
 
 // download performs the implementation of the object download across ranged
@@ -233,12 +230,66 @@ func (d *downloader) download() (n int64, err error) {
 	// this enables the functionality of ranged gets with the downloader but
 	// at the cost of no multipart downloads.
 	if rng := aws.ToString(d.in.Range); len(rng) > 0 {
-		d.downloadRange(rng)
-		return d.written, d.err
+		return 0, errors.New("the Range option is not allowed in this downloader")
 	}
 
+	// add a write thread/queue
+	toWrite := make(chan *dlchunk, d.cfg.MaxBufferedParts)
+
+	writeWg := sync.WaitGroup{}
+	writeWg.Add(1)
+
+	go func() {
+		defer writeWg.Done()
+
+		var pendingWrites []*dlchunk
+
+		for {
+			chunk := <-toWrite
+			if chunk == nil {
+				// channel empty
+				for _, c := range pendingWrites {
+					// replace/reset recycled buffer since we are cleaning up
+					d.cfg.BufPool.Put(c.buf)
+				}
+				return
+			}
+
+			if d.getErr() != nil {
+				// clear out channel on error
+				continue
+			}
+
+			if didWrite := d.writeOutChunkIfNeeded(chunk); !didWrite {
+				// we didn't write this chunk yet, so add it to the queue of pending writes
+				pendingWrites = append(pendingWrites, chunk)
+				// TODO: would be potentially faster with a min heap but I'm lazy and there are only going to
+				// be small number of items in here (should be less than or equal to MaxBufferedParts)
+				sort.SliceStable(pendingWrites, func(i, j int) bool {
+					return pendingWrites[i].start < pendingWrites[j].start
+				})
+				continue
+			}
+
+			// we wrote out this chunk, so lets see if this unblocked any pending writes we have
+			var newPendingWrites []*dlchunk
+			didNotWrite := false
+			for _, chunk := range pendingWrites {
+				if didNotWrite {
+					newPendingWrites = append(newPendingWrites, chunk)
+					continue
+				}
+				if didWrite := d.writeOutChunkIfNeeded(chunk); !didWrite {
+					didNotWrite = true
+					newPendingWrites = append(newPendingWrites, chunk)
+				}
+			}
+			pendingWrites = newPendingWrites
+		}
+	}()
+
 	// Spin off first worker to check additional header information
-	d.getChunk()
+	d.getChunk(toWrite)
 
 	if total := d.getTotalBytes(); total >= 0 {
 		// Spin up workers
@@ -246,7 +297,7 @@ func (d *downloader) download() (n int64, err error) {
 
 		for i := 0; i < d.cfg.Concurrency; i++ {
 			d.wg.Add(1)
-			go d.downloadPart(ch)
+			go d.downloadPart(ch, toWrite)
 		}
 
 		// Assign work
@@ -266,7 +317,7 @@ func (d *downloader) download() (n int64, err error) {
 	} else {
 		// Checking if we read anything new
 		for d.err == nil {
-			d.getChunk()
+			d.getChunk(toWrite)
 		}
 
 		// We expect a 416 error letting us know we are done downloading the
@@ -284,6 +335,9 @@ func (d *downloader) download() (n int64, err error) {
 		}
 	}
 
+	close(toWrite)
+	writeWg.Wait()
+
 	// Return error
 	return d.written, d.err
 }
@@ -293,20 +347,39 @@ func (d *downloader) download() (n int64, err error) {
 //
 // If this is the first worker, this operation also resolves the total number
 // of bytes to be read so that the worker manager knows when it is finished.
-func (d *downloader) downloadPart(ch chan dlchunk) {
+func (d *downloader) downloadPart(ch chan dlchunk, toWrite chan *dlchunk) {
 	defer d.wg.Done()
+
+	allowedBuffered := d.cfg.PartSize * int64(d.cfg.MaxBufferedParts)
+
 	for {
 		chunk, ok := <-ch
 		if !ok {
 			break
 		}
+
+		for {
+			if d.getErr() != nil {
+				break
+			}
+			// if we are attempting to download a part that is too far ahead, then wait a bit
+			// and check again before proceeding
+			flushed := d.getFlushed()
+			if flushed+allowedBuffered < chunk.start {
+				time.Sleep(time.Millisecond * 1)
+				continue
+			}
+			// otherwise continue on to download
+			break
+		}
+
 		if d.getErr() != nil {
 			// Drain the channel if there is an error, to prevent deadlocking
 			// of download producer.
 			continue
 		}
 
-		if err := d.downloadChunk(chunk); err != nil {
+		if err := d.downloadChunk(chunk, toWrite); err != nil {
 			d.setErr(err)
 		}
 	}
@@ -314,7 +387,7 @@ func (d *downloader) downloadPart(ch chan dlchunk) {
 
 // getChunk grabs a chunk of data from the body.
 // Not thread safe. Should only used when grabbing data on a single thread.
-func (d *downloader) getChunk() {
+func (d *downloader) getChunk(toWrite chan *dlchunk) {
 	if d.getErr() != nil {
 		return
 	}
@@ -322,34 +395,15 @@ func (d *downloader) getChunk() {
 	chunk := dlchunk{w: d.w, start: d.pos, size: d.cfg.PartSize}
 	d.pos += d.cfg.PartSize
 
-	if err := d.downloadChunk(chunk); err != nil {
+	if err := d.downloadChunk(chunk, toWrite); err != nil {
 		d.setErr(err)
 	}
-}
-
-// downloadRange downloads an Object given the passed in Byte-Range value.
-// The chunk used down download the range will be configured for that range.
-func (d *downloader) downloadRange(rng string) {
-	if d.getErr() != nil {
-		return
-	}
-
-	chunk := dlchunk{w: d.w, start: d.pos}
-	// Ranges specified will short circuit the multipart download
-	chunk.withRange = rng
-
-	if err := d.downloadChunk(chunk); err != nil {
-		d.setErr(err)
-	}
-
-	// Update the position based on the amount of data received.
-	d.pos = d.written
 }
 
 // downloadChunk downloads the chunk from s3
-func (d *downloader) downloadChunk(chunk dlchunk) error {
+func (d *downloader) downloadChunk(chunk dlchunk, toWrite chan *dlchunk) error {
 	in := &s3.GetObjectInput{}
-	awsutil.Copy(in, d.in)
+	Copy(in, d.in)
 
 	// Get the next byte range of data
 	in.Range = aws.String(chunk.ByteRange())
@@ -357,10 +411,19 @@ func (d *downloader) downloadChunk(chunk dlchunk) error {
 	var n int64
 	var err error
 	for retry := 0; retry <= d.partBodyMaxRetries; retry++ {
+		// get reset recycled buffer
+		chunk.buf = d.cfg.BufPool.Get()
+
 		n, err = d.tryDownloadChunk(in, &chunk)
+
 		if err == nil {
+			toWrite <- &chunk
 			break
 		}
+
+		// replace/reset recycled buffer on error
+		d.cfg.BufPool.Put(chunk.buf)
+
 		// Check if the returned error is an errReadingBody.
 		// If err is errReadingBody this indicates that an error
 		// occurred while copying the http response body.
@@ -372,10 +435,7 @@ func (d *downloader) downloadChunk(chunk dlchunk) error {
 			return err
 		}
 
-		chunk.cur = 0
-
-		d.cfg.Logger.Logf(logging.Debug, "object part body download interrupted %s, err, %v, retrying attempt %d",
-			aws.ToString(in.Key), err, retry)
+		log.Printf("object part body download interrupted %s, err, %v, retrying attempt %d", aws.ToString(in.Key), err, retry)
 	}
 
 	d.incrWritten(n)
@@ -384,12 +444,6 @@ func (d *downloader) downloadChunk(chunk dlchunk) error {
 }
 
 func (d *downloader) tryDownloadChunk(in *s3.GetObjectInput, w io.Writer) (int64, error) {
-	cleanup := func() {}
-	if d.cfg.BufferProvider != nil {
-		w, cleanup = d.cfg.BufferProvider.GetReadFrom(w)
-	}
-	defer cleanup()
-
 	resp, err := d.cfg.S3.GetObject(d.ctx, in, d.cfg.ClientOptions...)
 	if err != nil {
 		return 0, err
@@ -407,8 +461,8 @@ func (d *downloader) tryDownloadChunk(in *s3.GetObjectInput, w io.Writer) (int64
 
 // getTotalBytes is a thread-safe getter for retrieving the total byte status.
 func (d *downloader) getTotalBytes() int64 {
-	d.m.Lock()
-	defer d.m.Unlock()
+	d.m.RLock()
+	defer d.m.RUnlock()
 
 	return d.totalBytes
 }
@@ -461,10 +515,24 @@ func (d *downloader) incrWritten(n int64) {
 	d.written += n
 }
 
-// getErr is a thread-safe getter for the error object
-func (d *downloader) getErr() error {
+func (d *downloader) incrFlushed(n int64) {
 	d.m.Lock()
 	defer d.m.Unlock()
+
+	d.flushed += n
+}
+
+func (d *downloader) getFlushed() int64 {
+	d.m.RLock()
+	defer d.m.RUnlock()
+
+	return d.flushed
+}
+
+// getErr is a thread-safe getter for the error object
+func (d *downloader) getErr() error {
+	d.m.RLock()
+	defer d.m.RUnlock()
 
 	return d.err
 }
@@ -478,41 +546,22 @@ func (d *downloader) setErr(e error) {
 }
 
 // dlchunk represents a single chunk of data to write by the worker routine.
-// This structure also implements an io.SectionReader style interface for
-// io.WriterAt, effectively making it an io.SectionWriter (which does not
-// exist).
 type dlchunk struct {
-	w     io.WriterAt
+	w     io.Writer
 	start int64
 	size  int64
 	cur   int64
-
-	// specifies the byte range the chunk should be downloaded with.
-	withRange string
+	buf   *bytes.Buffer
 }
 
 // Write wraps io.WriterAt for the dlchunk, writing from the dlchunk's start
 // position to its end (or EOF).
-//
-// If a range is specified on the dlchunk the size will be ignored when writing.
-// as the total size may not of be known ahead of time.
 func (c *dlchunk) Write(p []byte) (n int, err error) {
-	if c.cur >= c.size && len(c.withRange) == 0 {
-		return 0, io.EOF
-	}
-
-	n, err = c.w.WriteAt(p, c.start+c.cur)
-	c.cur += int64(n)
-
-	return
+	return c.buf.Write(p)
 }
 
 // ByteRange returns a HTTP Byte-Range header value that should be used by the
 // client to request the chunk's range.
 func (c *dlchunk) ByteRange() string {
-	if len(c.withRange) != 0 {
-		return c.withRange
-	}
-
 	return fmt.Sprintf("bytes=%d-%d", c.start, c.start+c.size-1)
 }
