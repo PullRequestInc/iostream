@@ -16,6 +16,9 @@ jobs:
     - name: Check out code into the Go module directory
       uses: actions/checkout@v3
 
+    - name: get
+      run: go get ./...
+
     - name: vet
       run: go vet ./...
 
