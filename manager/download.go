@@ -107,7 +107,8 @@ func WithDownloaderClientOptions(opts ...func(*s3.Options)) func(*Downloader) {
 // interface.
 //
 // Example:
-// 	// Load AWS Config
+//
+//	// Load AWS Config
 //	cfg, err := config.LoadDefaultConfig(context.TODO())
 //	if err != nil {
 //		panic(err)
@@ -488,8 +489,8 @@ func (d *downloader) setTotalBytes(resp *s3.GetObjectOutput) {
 	if resp.ContentRange == nil {
 		// ContentRange is nil when the full file contents is provided, and
 		// is not chunked. Use ContentLength instead.
-		if resp.ContentLength > 0 {
-			d.totalBytes = resp.ContentLength
+		if resp.ContentLength != nil && *resp.ContentLength > 0 {
+			d.totalBytes = *resp.ContentLength
 			return
 		}
 	} else {
